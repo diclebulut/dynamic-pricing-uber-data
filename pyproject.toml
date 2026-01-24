@@ -1,0 +1,21 @@
+[project]
+name = "dynamic-pricing-uber"
+version = "0.1.0"
+description = "Dynamic pricing algorithms for ride-sharing data using ML and RL"
+authors = [
+    {name = "Dicle Bulut"}
+]
+license = {text = "MIT"}
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pandas (>=3.0.0,<4.0.0)",
+    "scikit-learn (>=1.8.0,<2.0.0)",
+    "autograd (>=1.8.0,<2.0.0)",
+    "matplotlib (>=3.10.8,<4.0.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
