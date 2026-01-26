@@ -18,6 +18,7 @@ RANDOM_STATE = 42
 
 LEARNING_RATE_GD = 1e-5
 MAX_ITERATIONS = 50
+COST = 0
 
 # ============================================
 # Reinforcement Learning parameters

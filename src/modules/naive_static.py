@@ -1,6 +1,7 @@
 
 import numpy as np
 from modules.util import intercept_reshaped_train_test
+from modules.config import COST
 def naive_static_pricing(X, y, preprocessor):
     X_train, X_test, y_train, y_test = intercept_reshaped_train_test(X, y, preprocessor)
     def demand_curve(axis, value):
@@ -18,7 +19,7 @@ def naive_static_pricing(X, y, preprocessor):
         return app_s
 
 
-    c = 0  #cost 0 since we do not have the information
+    c = COST  #cost 0 since we do not have the information
     axis_2 = np.linspace(0, int(np.round(np.max(y_train), 0) + 1), int(2 * (np.round(np.max(y_train), 0) + 1)))
     app_s_train = APP_s(axis_2, y_train[0], c)
     index = np.argmax(app_s_train)
