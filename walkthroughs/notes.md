@@ -4,6 +4,9 @@ new dataset because
 - information on driver side
 - more data points to make models more robust
 
+Info on new dataset
+- Only January 2021 is used due to dataset size and processing constraints
+
 Multicollinearity
 - trip time & trip miles (pick one)
 - tip & tipper flag (tip info should be removed)
