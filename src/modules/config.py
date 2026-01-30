@@ -4,6 +4,9 @@
 # ============================================
 
 DATA_PATH = 'src/data/uber_data.csv'
+DATA_PATH_V2 = 'data/fhvhv_tripdata_2021-01.parquet'
+TAXI_ZONE_PATH = 'data/taxi_zone_lookup.csv'
+WEATHER_NYC_PATH = 'data/nyc 2021-01-01 to 2021-12-31.csv'
 
 # ============================================
 # Columns as features
