@@ -13,7 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from modules.preprocessing import simple_preprocessing
+from modules.preprocessing import preprocess
 from modules.util import intercept_reshaped_train_test
 from modules.config import (
     LEARNING_RATE_GD, MAX_ITERATIONS, COST,
@@ -48,7 +48,7 @@ class DynamicPricingPipeline:
         self.log("="*60)
         
         self.log("\n[1/7] Loading and preprocessing data...")
-        preprocessor, X, y, categorical_features, numerical_features = simple_preprocessing()
+        preprocessor, X, y, categorical_features, numerical_features = preprocess()
         X_train, X_test, y_train, y_test = intercept_reshaped_train_test(X, y, preprocessor)
         self.log(f"  ✓ Training samples: {X_train.shape[2]}")
         self.log(f"  ✓ Test samples: {X_test.shape[2]}")
@@ -180,7 +180,7 @@ class DynamicPricingPipeline:
         self.log("="*60)
         
         self.log("\n[1/5] Loading and preprocessing data...")
-        preprocessor, X, y, categorical_features, numerical_features = simple_preprocessing()
+        preprocessor, X, y, categorical_features, numerical_features = preprocess()
         X_transformed = preprocessor.fit_transform(X)
         self.log(f"  ✓ Total samples: {len(y)}")
         self.log(f"  ✓ Features: {X_transformed.shape[1]}")

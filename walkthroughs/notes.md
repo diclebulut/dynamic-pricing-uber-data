@@ -19,3 +19,7 @@ Uber profit measures (try separately with all 3)
 - uber profit
 - uber_profit_per_second
 - uber_profit_per_mile
+
+Steps taken to pick features
+- Variance Inflation Factor (VIF) analysis
+- Basic correlation matrix
