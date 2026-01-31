@@ -20,8 +20,4 @@ Current Models (under development)
 - Gradient Descent
 - Reinforcement Learning
 
-Future Models
-- Static Price Buckets
-- Neural Networks
-
 
