@@ -1,12 +1,13 @@
 import pandas as pd
 import pyarrow.parquet as pq
 import numpy as np
-from modules.config import DATA_PATH, WEATHER_NYC_PATH
+from modules.config import DATA_PATH, WEATHER_NYC_PATH, TAXI_ZONE_PATH
 
 def prepare_columns():
     trips = pq.read_table(DATA_PATH)  
     trips = trips.to_pandas()
     weather = pd.read_csv(WEATHER_NYC_PATH)
+    zones = pd.read_csv(TAXI_ZONE_PATH)
     uber_trips = trips[trips["hvfhs_license_num"] == "HV0003"]
     uber_trips = uber_trips[uber_trips['trip_miles'] > 0]
 
@@ -44,17 +45,29 @@ def prepare_columns():
     )
 
     uber_trips['preciptype'] = uber_trips['preciptype'].fillna('None')
-    uber_trips.drop(columns=["hvfhs_license_num", "dispatching_base_num", "originating_base_num",
+    uber_trips_with_borough = uber_trips.merge(
+        zones.rename(columns={'LocationID': 'PULocationID', 'Borough': 'Pickup_Borough'})[['PULocationID', 'Pickup_Borough']],
+        on='PULocationID',
+        how='left'
+    )
+
+    uber_trips_with_borough = uber_trips_with_borough.merge(
+        zones.rename(columns={'LocationID': 'DOLocationID', 'Borough': 'Dropoff_Borough'})[['DOLocationID', 'Dropoff_Borough']],
+        on='DOLocationID',
+        how='left'
+    )
+
+    
+    uber_trips_with_borough.drop(columns=["hvfhs_license_num", "dispatching_base_num", "originating_base_num",
                             "on_scene_datetime", "access_a_ride_flag", "wav_request_flag",
                             "wav_match_flag", "pickup_datetime",
-                            "request_datetime", "dropoff_datetime", "datetime"], inplace=True)
-    uber_trips = uber_trips.reset_index(drop=True)
+                            "request_datetime", "dropoff_datetime", "datetime", "PULocationID", "DOLocationID"], inplace=True)
+    uber_trips_with_borough = uber_trips_with_borough.reset_index(drop=True)
 
-    uber_trips = uber_trips[uber_trips['day_of_month'] < 2]
-    uber_trips = uber_trips.head(10000)
-    #uber_trips["ride_id"] = uber_trips.index + 1
-    return uber_trips
-
+    uber_trips_with_borough = uber_trips_with_borough[uber_trips_with_borough['day_of_month'] < 2]
+    uber_trips_with_borough = uber_trips_with_borough.head(10000)
+    #uber_trips_with_borough["ride_id"] = uber_trips_with_borough.index + 1
+    return uber_trips_with_borough
 
 
 
