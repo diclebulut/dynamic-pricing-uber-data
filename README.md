@@ -1,4 +1,4 @@
-# dynamic-pricing
+# dynamic-pricing-uber-data
 
 In this repository, I take pricing concepts (static & dynamic) and apply them to publicly available Uber Rides data, which can be downloaded here: https://www.kaggle.com/datasets/shuhengmo/uber-nyc-forhire-vehicles-trip-data-2021
 
