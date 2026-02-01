@@ -1,352 +1,586 @@
 """
-Dynamic Pricing Pipeline
-Run with: python pipeline.py [method]
-Methods: gradient_descent, reinforcement_learning, both, compare
+Main Pipeline for Dynamic Pricing Comparison
+
+Orchestrates the full workflow: data preparation, static pricing,
+DQN dynamic pricing, and comparative analysis with optional output.
 """
 
-import sys
-import os
-import argparse
 import numpy as np
+import pandas as pd
+import torch
+import random
 import matplotlib.pyplot as plt
 from pathlib import Path
+from datetime import datetime
+from typing import Dict, Any, Tuple
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-
-from modules.preprocessing import simple_preprocessing
-from modules.util import intercept_reshaped_train_test
-from modules.config import (
-    LEARNING_RATE_GD, MAX_ITERATIONS, COST,
-    N_PRICE_ACTIONS, LEARNING_RATE_RL, DISCOUNT,
-    EPSILON, EPSILON_DECAY, EPISODES, N_EVAL_EPISODES
+from modules.preprocessing import prepare_columns
+from modules.config import TAXI_ZONE_PATH, NUM_PRICE_ACTIONS, NUM_TRAINING_EPISODES, BATCH_SIZE, TARGET_UPDATE_FREQUENCY, NUM_TEST_EPISODES, STEPS_PER_TEST_EPISODE, NUMERICAL_FEATURES, CATEGORICAL_FEATURES, TARGET_FEATURE
+from modules.static import train_static_model, apply_static_pricing, get_static_metrics
+from modules.reinforcement import (
+    PricingEnvironment,
+    DQNAgent,
+    train_dqn_agent,
+    test_dqn_agent,
+    get_dqn_metrics
 )
-from modules.gradient_descent import gradient_descent, least_squares, APP_s, APP_d
-from modules.reinforcement import PricingEnvironment, QLearningAgent, train_q_learning, evaluate_agent
-from modules.naive_static import naive_static_pricing
 
 
-class DynamicPricingPipeline:
-    """Main pipeline for dynamic pricing experiments"""
+def set_seeds(seed: int = 42):
+    """Set random seeds for reproducibility"""
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    random.seed(seed)
+
+
+def prepare_feature_engineered_data(
+    train_data_raw: pd.DataFrame,
+    test_data_raw: pd.DataFrame,
+    numerical_features: list = None,
+    categorical_features: list = None
+) -> Tuple[pd.DataFrame, pd.DataFrame, int, int, StandardScaler, OneHotEncoder]:
+    """
+    Prepare feature-engineered data for model training.
     
-    def __init__(self, save_plots=False, show_plots=True, verbose=True):
-        self.save_plots = save_plots
-        self.show_plots = show_plots
-        self.verbose = verbose
-        self.results = {}
+    Args:
+        train_data_raw: Raw training data
+        test_data_raw: Raw test data
+        numerical_features: List of numerical feature columns
+        categorical_features: List of categorical feature columns
+    
+    Returns:
+        tuple: (train_data, test_data, state_size, action_size, scaler, encoder)
+    """
+    if numerical_features is None:
+        numerical_features = NUMERICAL_FEATURES
+    
+    if categorical_features is None:
+        categorical_features = CATEGORICAL_FEATURES
+    
+    target_feature = TARGET_FEATURE
+    
+    print("="*70)
+    print("FEATURE ENGINEERING CONFIGURATION")
+    print("="*70)
+    print(f"Numerical Features ({len(numerical_features)}): {numerical_features}")
+    print(f"Categorical Features ({len(categorical_features)}): {categorical_features}")
+    print(f"Target Feature: {target_feature}\n")
+    
+    scaler = StandardScaler()
+    one_hot_encoder = OneHotEncoder(sparse_output=False, handle_unknown='ignore', drop='first')
+    
+    print("="*70)
+    print("FEATURE ENGINEERING (FIT ON TRAINING DATA)")
+    print("="*70)
+    
+    print("Fitting and scaling numerical features on training data...")
+    scaler.fit(train_data_raw[numerical_features])
+    train_numerical_data = scaler.transform(train_data_raw[numerical_features])
+    test_numerical_data = scaler.transform(test_data_raw[numerical_features])
+    
+    train_numerical_df = pd.DataFrame(
+        train_numerical_data,
+        columns=numerical_features,
+        index=train_data_raw.index
+    )
+    
+    test_numerical_df = pd.DataFrame(
+        test_numerical_data,
+        columns=numerical_features,
+        index=test_data_raw.index
+    )
+    
+    print("Fitting and one-hot encoding categorical features on training data...")
+    one_hot_encoder.fit(train_data_raw[categorical_features])
+    train_categorical_data = one_hot_encoder.transform(train_data_raw[categorical_features])
+    test_categorical_data = one_hot_encoder.transform(test_data_raw[categorical_features])
+    
+    categorical_feature_names = list(one_hot_encoder.get_feature_names_out(categorical_features))
+    
+    train_categorical_df = pd.DataFrame(
+        train_categorical_data,
+        columns=categorical_feature_names,
+        index=train_data_raw.index
+    )
+    
+    test_categorical_df = pd.DataFrame(
+        test_categorical_data,
+        columns=categorical_feature_names,
+        index=test_data_raw.index
+    )
+    
+    # Combine features
+    train_data = pd.concat([train_numerical_df, train_categorical_df], axis=1)
+    train_data[target_feature] = train_data_raw[target_feature].values
+    
+    test_data = pd.concat([test_numerical_df, test_categorical_df], axis=1)
+    test_data[target_feature] = test_data_raw[target_feature].values
+    
+    state_size = len(train_data.columns) - 1
+    action_size = NUM_PRICE_ACTIONS
+    
+    print(f"\nProcessed Training Data Shape: {train_data.shape}")
+    print(f"Processed Testing Data Shape: {test_data.shape}")
+    print(f"State Size: {state_size}")
+    print(f"Action Size: {action_size}\n")
+    
+    return train_data, test_data, state_size, action_size, scaler, one_hot_encoder
+
+
+def run_static_pricing_pipeline(
+    train_data_raw: pd.DataFrame,
+    test_data_raw: pd.DataFrame,
+    verbose: bool = True
+) -> pd.DataFrame:
+    """
+    Run static pricing strategy.
+    
+    Args:
+        train_data_raw: Training data
+        test_data_raw: Test data
+        verbose: Print detailed output
+    
+    Returns:
+        pd.DataFrame: Results with static pricing applied
+    """
+    print("\n" + "="*70)
+    print("STATIC PRICING STRATEGY (CALIBRATED ON TRAINING DATA)")
+    print("="*70)
+    
+    price_per_mile = train_static_model(train_data_raw)
+    print(f"\n1. Calibration Phase (using TRAINING data):")
+    print(f"   Calibrated Price Per Mile: ${price_per_mile:.2f}")
+    
+    print(f"\n2. Testing Phase (applying to TEST data):")
+    static_results = apply_static_pricing(test_data_raw, price_per_mile, verbose=verbose)
+    
+    return static_results
+
+
+def run_dqn_pipeline(
+    train_data: pd.DataFrame,
+    test_data: pd.DataFrame,
+    state_size: int,
+    action_size: int,
+    num_episodes: int = None,
+    batch_size: int = None,
+    update_frequency: int = None,
+    test_episodes: int = None,
+    verbose: bool = True
+) -> pd.DataFrame:
+    """
+    Run DQN dynamic pricing strategy.
+    
+    Args:
+        train_data: Feature-engineered training data
+        test_data: Feature-engineered test data
+        state_size: State vector size
+        action_size: Number of pricing actions
+        num_episodes: Training episodes
+        batch_size: Experience replay batch size
+        update_frequency: Target network update frequency
+        test_episodes: Number of test episodes
+        verbose: Print detailed output
+    
+    Returns:
+        pd.DataFrame: Test results with DQN pricing
+    """
+    if num_episodes is None:
+        num_episodes = NUM_TRAINING_EPISODES
+    if batch_size is None:
+        batch_size = BATCH_SIZE
+    if update_frequency is None:
+        update_frequency = TARGET_UPDATE_FREQUENCY
+    if test_episodes is None:
+        test_episodes = NUM_TEST_EPISODES
+    env_train = PricingEnvironment(train_data, num_price_actions=action_size)
+    env_test = PricingEnvironment(test_data, num_price_actions=action_size)
+    
+    agent = DQNAgent(state_size, action_size, learning_rate=0.001)
+    
+    train_dqn_agent(
+        env_train,
+        agent,
+        num_episodes=num_episodes,
+        batch_size=batch_size,
+        update_frequency=update_frequency,
+        verbose=verbose
+    )
+    
+    dqn_results = test_dqn_agent(
+        env_test,
+        agent,
+        num_episodes=test_episodes,
+        steps_per_episode=STEPS_PER_TEST_EPISODE,
+        verbose=verbose
+    )
+    
+    return dqn_results
+
+
+def compare_strategies(
+    static_results: pd.DataFrame,
+    dqn_results: pd.DataFrame,
+    test_data_raw: pd.DataFrame,
+    verbose: bool = True
+) -> Tuple[Dict[str, Any], Dict[str, Any], pd.DataFrame]:
+    """
+    Compare static and DQN strategies.
+    
+    Args:
+        static_results: Results from static pricing
+        dqn_results: Results from DQN pricing
+        test_data_raw: Original test data for reference
+        verbose: Print detailed output
+    
+    Returns:
+        tuple: (static_metrics, dqn_metrics, comparison_df)
+    """
+    if verbose:
+        print("\n" + "="*70)
+        print("COMPARISON: DYNAMIC PRICING (DQN) vs STATIC PRICING")
+        print("="*70)
+    
+    static_metrics = get_static_metrics(static_results)
+    dqn_metrics = get_dqn_metrics(dqn_results)
+    
+    if verbose:
+        print("\nSTATIC PRICING METRICS:")
+        print(f"  Average Fare Per Ride: ${static_metrics['avg_price']:.2f}")
+        print(f"  Total Revenue: ${static_metrics['total_revenue']:.2f}")
+        print(f"  Average Revenue Per Ride: ${static_metrics['avg_revenue_per_ride']:.2f}")
+        print(f"  Acceptance Rate: {static_metrics['acceptance_rate']:.2%}")
+        print(f"  Accepted Rides: {static_metrics['accepted_rides']} / {static_metrics['total_rides']}")
+        
+        print("\nDQN DYNAMIC PRICING METRICS:")
+        print(f"  Average Expected Revenue Multiplier: {dqn_metrics['avg_reward']:.4f}x")
+        print(f"  Average Acceptance Rate: {dqn_metrics['acceptance_rate']:.2%}")
+        print(f"  Total Revenue: ${dqn_metrics['total_revenue']:.2f}")
+        print(f"  Average Revenue per Ride: ${dqn_metrics['avg_revenue_per_ride']:.2f}")
+        print(f"  Accepted Rides: {dqn_metrics['accepted_rides']} ({dqn_metrics['accepted_rides']/dqn_metrics['total_rides']:.2%})")
+        
+        revenue_diff = dqn_metrics['total_revenue'] - static_metrics['total_revenue']
+        revenue_improvement = (revenue_diff / static_metrics['total_revenue'] * 100) if static_metrics['total_revenue'] > 0 else 0
+        
+        print("\nREVENUE COMPARISON:")
+        print(f"  Static Total Revenue: ${static_metrics['total_revenue']:.2f}")
+        print(f"  DQN Total Revenue: ${dqn_metrics['total_revenue']:.2f}")
+        print(f"  Revenue Difference: ${revenue_diff:.2f}")
+        print(f"  Improvement: {revenue_improvement:+.2f}%")
+    
+    comparison_df = pd.DataFrame({
+        'dqn_price': dqn_results['predicted_price'].values,
+        'dqn_accepted': dqn_results['is_accepted'].values,
+        'dqn_multiplier': dqn_results['multiplier'].values,
+        'dqn_reward': dqn_results['reward'].values,
+    })
+    
+    return static_metrics, dqn_metrics, comparison_df
+
+
+def generate_visualizations(
+    static_results: pd.DataFrame,
+    dqn_results: pd.DataFrame,
+    output_dir: Path = None
+) -> Path:
+    """
+    Generate comparison visualizations.
+    
+    Args:
+        static_results: Static pricing results
+        dqn_results: DQN pricing results
+        output_dir: Directory to save plots
+    
+    Returns:
+        Path: Directory where plots were saved
+    """
+    if output_dir is None:
+        output_dir = Path('outputs/visualizations')
+    
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+    
+    ax1 = axes[0, 0]
+    ax1.scatter(dqn_results['multiplier'], dqn_results['acceptance_rate'],
+                alpha=0.5, s=50, c=dqn_results['is_accepted'], cmap='RdYlGn', edgecolors='black')
+    ax1.set_xlabel('Price Multiplier', fontsize=12)
+    ax1.set_ylabel('Acceptance Rate', fontsize=12)
+    ax1.set_title('Acceptance Rate vs Price Multiplier', fontsize=14, fontweight='bold')
+    ax1.grid(True, alpha=0.3)
+    
+    ax2 = axes[0, 1]
+    ax2.hist(dqn_results['reward'], bins=30, color='#F18F01', alpha=0.7, edgecolor='black')
+    ax2.set_xlabel('Reward', fontsize=12)
+    ax2.set_ylabel('Frequency', fontsize=12)
+    ax2.set_title('Distribution of Rewards (Testing)', fontsize=14, fontweight='bold')
+    ax2.axvline(np.mean(dqn_results['reward']), color='red', linestyle='--', linewidth=2)
+    ax2.grid(True, alpha=0.3, axis='y')
+    
+    ax3 = axes[1, 0]
+    ax3.hist(dqn_results['predicted_price'], bins=30, color='#06A77D', alpha=0.7,
+             label='DQN Price', edgecolor='black')
+    ax3.hist(dqn_results['actual_fare'], bins=30, color='#D62828', alpha=0.5,
+             label='Actual Fare', edgecolor='black')
+    ax3.set_xlabel('Price ($)', fontsize=12)
+    ax3.set_ylabel('Frequency', fontsize=12)
+    ax3.set_title('Predicted Price vs Actual Fare Distribution', fontsize=14, fontweight='bold')
+    ax3.legend()
+    ax3.grid(True, alpha=0.3, axis='y')
+    
+    ax4 = axes[1, 1]
+    acceptance_data = [
+        dqn_results['is_accepted'].sum(),
+        len(dqn_results) - dqn_results['is_accepted'].sum()
+    ]
+    colors = ['#2E86AB', '#A23B72']
+    ax4.pie(acceptance_data, labels=['Accepted', 'Rejected'], autopct='%1.1f%%',
+            colors=colors, startangle=90)
+    ax4.set_title('DQN Acceptance Rate Distribution', fontsize=14, fontweight='bold')
+    
+    plt.tight_layout()
+    plot_path = output_dir / f"comparison_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    return output_dir
+
+
+def save_markdown_report(
+    static_metrics: Dict[str, Any],
+    dqn_metrics: Dict[str, Any],
+    comparison_df: pd.DataFrame,
+    output_dir: Path = None,
+    complexity: str = 'full'
+) -> Path:
+    """
+    Save analysis results as markdown report.
+    
+    Args:
+        static_metrics: Static pricing metrics
+        dqn_metrics: DQN pricing metrics
+        comparison_df: Comparison dataframe
+        output_dir: Output directory
+        complexity: 'summary', 'standard', or 'full'
+    
+    Returns:
+        Path: Path to saved markdown file
+    """
+    if output_dir is None:
+        output_dir = Path('outputs/reports')
+    
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    report_path = output_dir / f"pricing_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+    
+    with open(report_path, 'w') as f:
+        f.write("# Dynamic Pricing Analysis Report\n\n")
+        f.write(f"**Generated:** {timestamp}\n\n")
+        
+        f.write("## Executive Summary\n\n")
+        revenue_diff = dqn_metrics['total_revenue'] - static_metrics['total_revenue']
+        revenue_improvement = (revenue_diff / static_metrics['total_revenue'] * 100) if static_metrics['total_revenue'] > 0 else 0
+        
+        f.write(f"- **Revenue Improvement:** {revenue_improvement:+.2f}%\n")
+        f.write(f"- **DQN Acceptance Rate:** {dqn_metrics['acceptance_rate']:.2%}\n")
+        f.write(f"- **Static Acceptance Rate:** {static_metrics['acceptance_rate']:.2%}\n\n")
+        
+        f.write("## Static Pricing Results\n\n")
+        f.write("| Metric | Value |\n")
+        f.write("|--------|-------|\n")
+        f.write(f"| Average Price Per Ride | ${static_metrics['avg_price']:.2f} |\n")
+        f.write(f"| Total Revenue | ${static_metrics['total_revenue']:.2f} |\n")
+        f.write(f"| Acceptance Rate | {static_metrics['acceptance_rate']:.2%} |\n")
+        f.write(f"| Accepted Rides | {static_metrics['accepted_rides']} / {static_metrics['total_rides']} |\n\n")
+        
+        f.write("## DQN Dynamic Pricing Results\n\n")
+        f.write("| Metric | Value |\n")
+        f.write("|--------|-------|\n")
+        f.write(f"| Average Price Per Ride | ${dqn_metrics['avg_price']:.2f} |\n")
+        f.write(f"| Average Revenue Multiplier | {dqn_metrics['avg_reward']:.4f}x |\n")
+        f.write(f"| Total Revenue | ${dqn_metrics['total_revenue']:.2f} |\n")
+        f.write(f"| Acceptance Rate | {dqn_metrics['acceptance_rate']:.2%} |\n")
+        f.write(f"| Accepted Rides | {dqn_metrics['accepted_rides']} / {dqn_metrics['total_rides']} |\n\n")
+        
+        if complexity in ['standard', 'full']:
+            f.write("## Detailed Comparison\n\n")
+            f.write(f"- **Revenue Difference:** ${revenue_diff:.2f}\n")
+            f.write(f"- **DQN Price Std Dev:** ${dqn_metrics['price_std']:.2f}\n")
+            f.write(f"- **Static Price Std Dev:** ${static_metrics['price_std']:.2f}\n\n")
+        
+        if complexity == 'full':
+            f.write("## Acceptance Rate Comparison\n\n")
+            acceptance_improvement = (dqn_metrics['acceptance_rate'] - static_metrics['acceptance_rate']) * 100
+            f.write(f"- **Acceptance Rate Difference:** {acceptance_improvement:+.2f} percentage points\n")
+            f.write(f"- **DQN Acceptance:** {dqn_metrics['accepted_rides']} rides\n")
+            f.write(f"- **Static Acceptance:** {static_metrics['accepted_rides']} rides\n\n")
+            
+            f.write("## Statistical Summary\n\n")
+            f.write(f"- **DQN Avg Multiplier:** {dqn_metrics['avg_multiplier']:.4f}x\n")
+            f.write(f"- **Total Rides Evaluated:** {len(comparison_df)}\n\n")
+    
+    return report_path
+
+
+def main(
+    verbose: bool = True,
+    save_markdown: bool = False,
+    markdown_complexity: str = 'full',
+    save_plots: bool = False,
+    num_training_episodes: int = None,
+    batch_size: int = None,
+    update_frequency: int = None,
+    test_episodes: int = None
+):
+    """
+    Main pipeline orchestration.
+    
+    Args:
+        verbose: Print detailed output
+        save_markdown: Save results as markdown report
+        markdown_complexity: 'summary', 'standard', or 'full'
+        save_plots: Save visualization plots
+        num_training_episodes: DQN training episodes
+        batch_size: Experience replay batch size
+        update_frequency: Target network update frequency
+        test_episodes: Number of test episodes
+    """
+    if num_training_episodes is None:
+        num_training_episodes = NUM_TRAINING_EPISODES
+    if batch_size is None:
+        batch_size = BATCH_SIZE
+    if update_frequency is None:
+        update_frequency = TARGET_UPDATE_FREQUENCY
+    if test_episodes is None:
+        test_episodes = NUM_TEST_EPISODES
+    set_seeds(42)
+    
+    if verbose:
+        print("\n" + "="*70)
+        print("DYNAMIC PRICING ANALYSIS PIPELINE")
+        print("="*70)
+    
+    if verbose:
+        print("\nStep 1: Loading and preparing data...")
+    
+    uber_trips = prepare_columns()
+    data_raw = uber_trips.copy()
+    
+    train_data_raw, test_data_raw = train_test_split(
+        data_raw,
+        test_size=0.2,
+        random_state=42
+    )
+    
+    if verbose:
+        print(f"  Training data: {len(train_data_raw)} rides")
+        print(f"  Test data: {len(test_data_raw)} rides")
+    
+    if verbose:
+        print("\nStep 2: Feature engineering...")
+    
+    train_data, test_data, state_size, action_size, scaler, encoder = prepare_feature_engineered_data(
+        train_data_raw,
+        test_data_raw
+    )
+    
+    if verbose:
+        print("\nStep 3: Running static pricing strategy...")
+    
+    static_results = run_static_pricing_pipeline(
+        train_data_raw,
+        test_data_raw,
+        verbose=verbose
+    )
+    
+    if verbose:
+        print("\nStep 4: Running DQN dynamic pricing strategy...")
+    
+    dqn_results = run_dqn_pipeline(
+        train_data,
+        test_data,
+        state_size,
+        action_size,
+        num_episodes=num_training_episodes,
+        batch_size=batch_size,
+        update_frequency=update_frequency,
+        test_episodes=test_episodes,
+        verbose=verbose
+    )
+    
+    if verbose:
+        print("\nStep 5: Comparing strategies...")
+    
+    static_metrics, dqn_metrics, comparison_df = compare_strategies(
+        static_results,
+        dqn_results,
+        test_data_raw,
+        verbose=verbose
+    )
+    
+    if save_markdown or save_plots:
+        if verbose:
+            print("\nStep 6: Saving outputs...")
+        
+        if save_markdown:
+            report_path = save_markdown_report(
+                static_metrics,
+                dqn_metrics,
+                comparison_df,
+                complexity=markdown_complexity
+            )
+            if verbose:
+                print(f"  ✓ Markdown report saved to {report_path}")
         
         if save_plots:
-            self.output_dir = Path('output')
-            self.output_dir.mkdir(exist_ok=True)
+            plot_dir = generate_visualizations(
+                static_results,
+                dqn_results
+            )
+            if verbose:
+                print(f"  ✓ Plots saved to {plot_dir}")
     
-    def log(self, message):
-        if self.verbose:
-            print(message)
+    if verbose:
+        print("\n" + "="*70)
+        print("PIPELINE COMPLETE")
+        print("="*70 + "\n")
     
-    def run_gradient_descent(self):
-        self.log("\n" + "="*60)
-        self.log("GRADIENT DESCENT PRICING PIPELINE")
-        self.log("="*60)
-        
-        self.log("\n[1/7] Loading and preprocessing data...")
-        preprocessor, X, y, categorical_features, numerical_features = simple_preprocessing()
-        X_train, X_test, y_train, y_test = intercept_reshaped_train_test(X, y, preprocessor)
-        self.log(f"  ✓ Training samples: {X_train.shape[2]}")
-        self.log(f"  ✓ Test samples: {X_test.shape[2]}")
-        self.log(f"  ✓ Features: {X_train.shape[1]}")
-        
-        self.log("\n[2/7] Training gradient descent model...")
-        initial_weights = np.random.rand(X_train.shape[1])
-        wh, ch = gradient_descent(
-            least_squares, LEARNING_RATE_GD, MAX_ITERATIONS,
-            initial_weights, X_train, y_train
-        )
-        index = np.argmin(ch)
-        w_star = wh[index]
-        self.log(f"  ✓ Converged after {index} iterations")
-        
-        self.log("\n[3/7] Evaluating model quality...")
-        cost_train = ch[index]
-        cost_test = least_squares(w_star, X_test, y_test) / X_test.shape[2]
-        self.log(f"  ✓ Training Cost: {cost_train:.2f}")
-        self.log(f"  ✓ Test Cost: {cost_test:.2f}")
-        self.log(f"  ✓ Test/Train Ratio: {cost_test/cost_train:.3f}")
-        
-        self.log("\n[4/7] Computing static pricing baseline...")
-        axis_2 = np.linspace(0, int(np.round(np.max(y_train), 0) + 1), 
-                            int(2 * (np.round(np.max(y_train), 0) + 1)))
-        app_s_train = APP_s(axis_2, y_train[0], COST)
-        static_index = np.argmax(app_s_train)
-        app_s_test = APP_s(axis_2, y_test[0], COST)
-        app_s_star = app_s_test[static_index]
-        optimal_static_price = axis_2[static_index]
-        self.log(f"  ✓ Optimal Static Price: ${optimal_static_price:.2f}")
-        self.log(f"  ✓ Static APP: ${app_s_star:.2f}")
-
-        if self.show_plots or self.save_plots:
-            plt.figure(figsize=(10, 6))
-            plt.plot(axis_2, app_s_train)
-            plt.axvline(optimal_static_price, color='r', linestyle='--', label=f'Optimal: ${optimal_static_price:.2f}')
-            plt.xlabel('Price')
-            plt.ylabel('APP')
-            plt.title('Static Price Profit Maximization')
-            plt.legend()
-            plt.grid(True, alpha=0.3)
-            if self.save_plots:
-                plt.savefig(self.output_dir / 'static_pricing.png', dpi=300, bbox_inches='tight')
-            if self.show_plots:
-                plt.show()
-            plt.close()
-        
-        if self.show_plots or self.save_plots:
-            plt.figure(figsize=(10, 6))
-            plt.plot(range(MAX_ITERATIONS + 1), ch)
-            plt.axhline(cost_train, color='r', linestyle='--', label=f'Min Cost: {cost_train:.2f}')
-            plt.xlabel('Iteration')
-            plt.ylabel('Cost')
-            plt.title('Gradient Descent Convergence')
-            plt.legend()
-            plt.grid(True, alpha=0.3)
-            if self.save_plots:
-                plt.savefig(self.output_dir / 'gd_convergence.png', dpi=300, bbox_inches='tight')
-            if self.show_plots:
-                plt.show()
-            plt.close()
-        
-        self.log("\n[5/7] Analyzing feature importance...")
-        categorical_transformer = preprocessor.transformers_[1][1]
-        feature_names_categorical = list(categorical_transformer.get_feature_names_out(
-            input_features=categorical_features
-        ))
-        feature_names = ['Intercept'] + numerical_features + feature_names_categorical
-        
-        if self.verbose:
-            self.log("\n  Optimized Weights:")
-            for feature, weight in zip(feature_names, np.round(w_star, 2)):
-                self.log(f"    {feature:30s}: {weight:6.2f}")
-        
-        self.log("\n[6/7] Testing dynamic pricing (no discount)...")
-        app_d_1 = APP_d(w_star, X_test, y_test, COST, 1)
-        self.log(f"  ✓ Dynamic APP (d=1.0): ${app_d_1:.2f}")
-        
-        self.log("\n[7/7] Optimizing discount factor...")
-        axis_d = np.linspace(0.7, 1, 16)
-        app_d = [APP_d(w_star, X_test, y_test, COST, d) for d in axis_d]
-        d_star = axis_d[np.argmax(app_d)]
-        app_d_star = APP_d(w_star, X_test, y_test, COST, d_star)
-        self.log(f"  ✓ Optimal Discount: {d_star:.2f}")
-        self.log(f"  ✓ Dynamic APP (optimized): ${app_d_star:.2f}")
-        
-        if self.show_plots or self.save_plots:
-            plt.figure(figsize=(10, 6))
-            plt.plot(axis_d, app_d, marker='o')
-            plt.axvline(d_star, color='r', linestyle='--', label=f'Optimal: {d_star:.2f}')
-            plt.axhline(app_d_star, color='g', linestyle='--', alpha=0.5, label=f'Max APP: ${app_d_star:.2f}')
-            plt.xlabel('Discount Factor')
-            plt.ylabel('APP')
-            plt.title('Dynamic Price Profit Maximization')
-            plt.legend()
-            plt.grid(True, alpha=0.3)
-            if self.save_plots:
-                plt.savefig(self.output_dir / 'discount_optimization.png', dpi=300, bbox_inches='tight')
-            if self.show_plots:
-                plt.show()
-            plt.close()
-        
-        self.results['gradient_descent'] = {
-            'static_app': app_s_star,
-            'static_price': optimal_static_price,
-            'dynamic_app': app_d_star,
-            'discount': d_star,
-            'cost_train': cost_train,
-            'cost_test': cost_test,
-            'weights': dict(zip(feature_names, w_star)),
-            'improvement': (app_d_star - app_s_star) / app_s_star * 100
-        }
-        
-        self.log("\n" + "="*60)
-        self.log("GRADIENT DESCENT RESULTS SUMMARY")
-        self.log("="*60)
-        self.log(f"Static Pricing APP:        ${app_s_star:.2f}")
-        self.log(f"Dynamic Pricing APP:       ${app_d_star:.2f}")
-        self.log(f"Profit Improvement:        {self.results['gradient_descent']['improvement']:.2f}%")
-        self.log("="*60 + "\n")
-        
-        return self.results['gradient_descent']
-    
-    def run_reinforcement_learning(self):
-        """Run Q-learning reinforcement learning"""
-        self.log("\n" + "="*60)
-        self.log("REINFORCEMENT LEARNING PRICING PIPELINE")
-        self.log("="*60)
-        
-        self.log("\n[1/5] Loading and preprocessing data...")
-        preprocessor, X, y, categorical_features, numerical_features = simple_preprocessing()
-        X_transformed = preprocessor.fit_transform(X)
-        self.log(f"  ✓ Total samples: {len(y)}")
-        self.log(f"  ✓ Features: {X_transformed.shape[1]}")
-        
-        price_min = y.min() * 0.8
-        price_max = y.max() * 1.2
-        self.log(f"  ✓ Price range: ${price_min:.2f} - ${price_max:.2f}")
-        
-        self.log("\n[2/5] Initializing environment and agent...")
-        env = PricingEnvironment(X_transformed, y, cost=0)
-        agent = QLearningAgent(
-            n_price_actions=N_PRICE_ACTIONS,
-            price_min=price_min,
-            price_max=price_max,
-            learning_rate=LEARNING_RATE_RL,
-            discount=DISCOUNT,
-            epsilon=EPSILON,
-            epsilon_decay=EPSILON_DECAY
-        )
-        self.log(f"  ✓ Action space: {N_PRICE_ACTIONS} discrete prices")
-        self.log(f"  ✓ Learning rate: {LEARNING_RATE_RL}")
-        self.log(f"  ✓ Initial epsilon: {EPSILON}")
-        
-        self.log(f"\n[3/5] Training Q-Learning agent ({EPISODES} episodes)...")
-        rewards, profits = train_q_learning(env, agent, episodes=EPISODES)
-        self.log(f"  ✓ Training complete")
-        self.log(f"  ✓ Final epsilon: {agent.epsilon:.4f}")
-        self.log(f"  ✓ Q-table size: {len(agent.q_table)} states")
-        
-        self.log(f"\n[4/5] Evaluating trained agent ({N_EVAL_EPISODES} episodes)...")
-        final_app = evaluate_agent(env, agent, n_eval_episodes=N_EVAL_EPISODES)
-        self.log(f"  ✓ Q-Learning APP: ${final_app:.2f}")
-        
-        self.log("\n[5/5] Computing static baseline...")
-        optimised_static_app, optimised_price, app_s_train = naive_static_pricing(X, y, preprocessor)
-        self.log(f"  ✓ Static APP: ${optimised_static_app:.2f}")
-        self.log(f"  ✓ Optimal price: ${optimised_price:.2f}")
-        
-        if self.show_plots or self.save_plots:
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
-            
-            ax1.plot(rewards)
-            ax1.set_xlabel('Episode')
-            ax1.set_ylabel('Total Reward')
-            ax1.set_title('Q-Learning Training Progress')
-            ax1.grid(True, alpha=0.3)
-            
-            ax2.plot(profits, label='Training APP')
-            ax2.axhline(final_app, color='g', linestyle='--', label=f'Final APP: ${final_app:.2f}')
-            ax2.axhline(optimised_static_app, color='r', linestyle='--', label=f'Static APP: ${optimised_static_app:.2f}')
-            ax2.set_xlabel('Episode')
-            ax2.set_ylabel('Average Profit Per Person')
-            ax2.set_title('APP Over Training')
-            ax2.legend()
-            ax2.grid(True, alpha=0.3)
-            
-            plt.tight_layout()
-            if self.save_plots:
-                plt.savefig(self.output_dir / 'rl_training.png', dpi=300, bbox_inches='tight')
-            if self.show_plots:
-                plt.show()
-            plt.close()
-        
-        self.results['reinforcement_learning'] = {
-            'static_app': optimised_static_app,
-            'static_price': optimised_price,
-            'rl_app': final_app,
-            'q_table_size': len(agent.q_table),
-            'final_epsilon': agent.epsilon,
-            'improvement': (final_app - optimised_static_app) / optimised_static_app * 100
-        }
-        
-        self.log("\n" + "="*60)
-        self.log("REINFORCEMENT LEARNING RESULTS SUMMARY")
-        self.log("="*60)
-        self.log(f"Static Pricing APP:        ${optimised_static_app:.2f}")
-        self.log(f"Q-Learning APP:            ${final_app:.2f}")
-        self.log(f"Profit Improvement:        {self.results['reinforcement_learning']['improvement']:.2f}%")
-        self.log("="*60 + "\n")
-        
-        return self.results['reinforcement_learning']
-    
-    def run_comparison(self):
-        """Run both methods and compare"""
-        gd_results = self.run_gradient_descent()
-        rl_results = self.run_reinforcement_learning()
-        
-        self.log("\n" + "="*60)
-        self.log("FINAL COMPARISON: GRADIENT DESCENT vs Q-LEARNING")
-        self.log("="*60)
-        self.log(f"\nStatic Baseline:           ${gd_results['static_app']:.2f}")
-        self.log(f"Gradient Descent:          ${gd_results['dynamic_app']:.2f} (+{gd_results['improvement']:.2f}%)")
-        self.log(f"Q-Learning:                ${rl_results['rl_app']:.2f} (+{rl_results['improvement']:.2f}%)")
-        
-        winner = "Q-Learning" if rl_results['rl_app'] > gd_results['dynamic_app'] else "Gradient Descent"
-        self.log(f"\nBest model: {winner}")
-        self.log("="*60 + "\n")
-        
-        return self.results
-
-
-def main():
-    """Main entry point for CLI"""
-    parser = argparse.ArgumentParser(
-        description='Dynamic Pricing Pipeline for Uber Data',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python pipeline.py gradient_descent              # Run gradient descent only
-  python pipeline.py reinforcement_learning        # Run Q-learning only
-  python pipeline.py compare                       # Run both and compare
-  python pipeline.py compare --no-plots            # Run without showing plots
-  python pipeline.py compare --save-plots          # Save plots to output/
-  python pipeline.py gradient_descent --quiet      # Minimal output
-        """
-    )
-    
-    parser.add_argument(
-        'method',
-        choices=['gradient_descent', 'reinforcement_learning', 'compare', 'both'],
-        help='Method to run'
-    )
-    
-    parser.add_argument(
-        '--no-plots',
-        action='store_true',
-        help='Disable plot display'
-    )
-    
-    parser.add_argument(
-        '--save-plots',
-        action='store_true',
-        help='Save plots to output/ directory'
-    )
-    
-    parser.add_argument(
-        '--quiet',
-        action='store_true',
-        help='Minimal output'
-    )
-    
-    args = parser.parse_args()
-    
-    pipeline = DynamicPricingPipeline(
-        save_plots=args.save_plots,
-        show_plots=not args.no_plots,
-        verbose=not args.quiet
-    )
-    
-    try:
-        if args.method == 'gradient_descent':
-            pipeline.run_gradient_descent()
-        elif args.method == 'reinforcement_learning':
-            pipeline.run_reinforcement_learning()
-        elif args.method in ['compare', 'both']:
-            pipeline.run_comparison()
-    except KeyboardInterrupt:
-        print("\n\nInterrupted by user. Exiting...")
-        sys.exit(0)
-    except Exception as e:
-        print(f"\nError: {e}")
-        if not args.quiet:
-            import traceback
-            traceback.print_exc()
-        sys.exit(1)
+    return {
+        'static_metrics': static_metrics,
+        'dqn_metrics': dqn_metrics,
+        'comparison_df': comparison_df,
+        'train_data': train_data,
+        'test_data': test_data,
+    }
 
 
 if __name__ == '__main__':
-    main()
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Dynamic Pricing Analysis Pipeline')
+    parser.add_argument('--verbose', type=bool, default=True, help='Print detailed output')
+    parser.add_argument('--save-markdown', action='store_true', help='Save markdown report')
+    parser.add_argument('--markdown-complexity', choices=['summary', 'standard', 'full'],
+                       default='full', help='Markdown report complexity level')
+    parser.add_argument('--save-plots', action='store_true', help='Save visualization plots')
+    parser.add_argument('--episodes', type=int, default=100, help='DQN training episodes')
+    parser.add_argument('--batch-size', type=int, default=32, help='Experience replay batch size')
+    parser.add_argument('--update-freq', type=int, default=10, help='Target network update frequency')
+    parser.add_argument('--test-episodes', type=int, default=20, help='Number of test episodes')
+    
+    args = parser.parse_args()
+    
+    main(
+        verbose=args.verbose,
+        save_markdown=args.save_markdown,
+        markdown_complexity=args.markdown_complexity,
+        save_plots=args.save_plots,
+        num_training_episodes=args.episodes,
+        batch_size=args.batch_size,
+        update_frequency=args.update_freq,
+        test_episodes=args.test_episodes
+    )
